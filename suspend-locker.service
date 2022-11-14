@@ -1,0 +1,17 @@
+[Unit]
+Description=Lock screen on suspend
+Before=sleep.target
+
+[Service]
+Type=forking
+ExecStart=-/usr/local/bin/suspend-locker
+; None of many proferred bash solutions will
+; prevent the locker script from writing
+; 'Terminated' to the log when they kill
+; dbus-monitor - note that this is
+; shell, not kill, output, so ...
+StandardOutput=null
+
+[Install]
+WantedBy=sleep.target
+

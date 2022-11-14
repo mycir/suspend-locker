@@ -1,0 +1,118 @@
+#!/bin/bash
+
+export LOG_PIPE=/tmp/suspend-locker.out
+mkfifo $LOG_PIPE
+systemd-cat -p info < $LOG_PIPE &
+exec 3>$LOG_PIPE
+echo -e "suspend-locker starting\n" > $LOG_PIPE
+
+# determine active session and save uid as $User,
+# user name as $Name and user display as $Display
+export $(
+    loginctl list-sessions --no-legend | \
+    while read id ignored; do
+        s=$(loginctl show-session -p Id -p User -p State -p Name -p Display $id)
+        if [[ $s == *"State=active"* ]]; then
+            echo $s
+        fi
+    done
+)
+
+# /home/$Name would be a dangerous assumption -
+# could be mounted on a separate partiton, so
+home=$(getent passwd $Name | cut -f6 -d:)
+
+export DISPLAY=$Display
+export XAUTHORITY=$home/.Xauthority
+# Ryzen 5/Radeon graphics:
+# some versions of AMD driver show brief
+# screen corruption or break compositor
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$User/bus
+runuser -u $Name qdbus org.kde.KWin /Compositor suspend
+
+# disable pointer devices to prevent
+# accidental reveal of lock screen
+# during suspend, e.g. by brushing touchpad 
+export INPUTS=($(xinput --list | grep -Po "(?<=id=)\d*(?=.*slave\s*pointer)"))
+for i in "${INPUTS[@]}"; do xinput --disable $i; done
+# hide lock screen
+xset dpms force off &
+# allow a little time for blanking
+sleep 0.5
+
+if [ -e "$home/.config/suspend-locker.conf" ] ; then
+  CONFIG_PATH="$home/.config"
+  IMAGE_PATH="$home/.local/share/wallpapers"
+else
+  CONFIG_PATH="/etc"
+  IMAGE_PATH="/usr/share/backgrounds"
+fi
+
+export LOCKER=$(kreadconfig5 --file $CONFIG_PATH/suspend-locker.conf --group General --key Locker)
+
+# wait for lock
+if [ "$LOCKER" == "i3lock" ] ; then
+  WALLPAPER=$(kreadconfig5 --file $CONFIG_PATH/suspend-locker.conf --group General --key Wallpaper)
+  sudo -u $Name i3lock -i $IMAGE_PATH/$WALLPAPER
+  while true; do
+    xwininfo -name "i3lock" > /dev/null
+    if [ "$?" == 0 ]; then break; fi
+    sleep 0.25
+  done
+else
+  loginctl lock-session $Id
+  runuser -u $Name -- dbus-monitor --session "type='signal',interface='org.freedesktop.ScreenSaver'" |
+  while read x; do
+    case "$x" in
+      *"boolean true"*)
+        runuser -u $Name -- pkill -U $User "dbus-monitor"
+        break;;
+    esac
+  done
+fi
+
+# fork now to allow suspend to continue
+(
+  TIMEFORMAT="%3R"
+  # time to sleep in ms whilst
+  # waiting for resume
+  SLEEP=250
+  # latency margin in ms, adjust to suit
+  LATENCY_MARGIN=250
+
+  # wait for resume
+  while true; do
+    SLEPT=$({ time sleep 0.$SLEEP; } 2>&1); SLEPT=$((10#${SLEPT/./}))
+    # consider ($SLEPT - $SLEEP) > $LATENCY_MARGIN as resume
+    if ((($SLEPT - $((10#${SLEEP/./}))) > LATENCY_MARGIN)); then break; fi
+  done
+
+  echo -e "suspend-locker resuming\n" > $LOG_PIPE
+  # re-enable screen
+  xset dpms force on
+  # re-enable inputs
+  for i in "${INPUTS[@]}"; do xinput --enable $i; done
+
+  # wait for unlock
+  if [ "$LOCKER" == "i3lock" ] ; then
+    while true; do
+      pgrep i3lock &>/dev/null
+      if [ "$?" == 1 ]; then break; fi
+      sleep 0.5
+    done
+  else
+    runuser -u $Name -- dbus-monitor --session "type='signal',interface='org.freedesktop.ScreenSaver'" |
+    while read x; do
+      case "$x" in
+        *"boolean false"*)
+          runuser -u $Name -- pkill -U $User "dbus-monitor"
+          break;;
+      esac
+    done
+  fi
+
+  runuser -u $Name qdbus org.kde.KWin /Compositor resume
+  echo -e "suspend-locker finished\n" > $LOG_PIPE
+  exec 3>&-
+  rm $LOG_PIPE
+) &
